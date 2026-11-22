@@ -15,7 +15,8 @@ A Tampermonkey userscript that puts a **Download** button right next to Bilibili
 - **Multi-part videos** — a dropdown appears for multi-P videos; switching re-probes immediately.
 - **Streaming writes to disk** — 4 MB HTTP `Range` chunks × 4 threads, written in chunk order through `FileSystemWritableFileStream`, with back-pressure at 6 pending chunks. Memory stays flat (~24 MB) even for a 466 MB 8K file.
 - **Audio-only mode** — skip the video track entirely and get a single `.m4a` (handy for ripping BGM).
-- **Automatic merge** — a pure-JS fMP4 remuxer inside the script (~150 lines) joins the two tracks into one file with sound. No re-encoding, no external binary, no 30 MB wasm payload.
+- **Automatic merge** — a pure-JS fMP4 remuxer inside the script joins the two tracks into one file with sound. No re-encoding, no external binary, no 30 MB wasm payload.
+- **The merge is streaming too** — it scans fragment offsets first, then reads / patches / writes one fragment at a time, so memory tracks the **largest single fragment** (about 12 MB for 8K) instead of the file size. A 466 MB 8K file merges on a phone without blowing up the WebView.
 - **Only one file left behind** — the intermediate video/audio tracks are deleted after a successful merge.
 - **Three-tier button mounting** — detail-page toolbar → player control bar → floating button in the corner.
 
@@ -116,7 +117,22 @@ No encoded data is touched — only a handful of 4-byte fields change and the fr
 - output size ≈ video + audio, plus ~1.3 KB of moov
 - H.264, HEVC and AV1 all work, because only the `trak` boxes are moved
 
-The browser implementation is the `FMP4` module inside the userscript (~150 lines). `tools/fmp4mux.js` is the same logic as a Node CLI for verification.
+### Why streaming instead of reading everything into memory
+
+The first implementation read both tracks, copied them with `new Uint8Array`, sliced every fragment and concatenated the output — a peak of **3× the video size**. For the 466 MB 8K file that means ~1.4 GB allocated at once. Desktop Chrome survives it; Android WebView and phones kill the renderer outright (the page shows "Aw, Snap").
+
+It now does:
+
+```
+1. read the first 1 MB only, parse ftyp/moov, build the new moov
+2. walk box headers, recording each (moof+mdat) offset, size and tfdt decode time
+3. sort by decode time, then read → patch track_id → write, fragment by fragment
+4. write straight to disk, dropping each fragment as soon as it is written
+```
+
+Peak memory = the largest fragment (about 12 MB for 8K), independent of file size. Verified: the streaming and in-memory versions produce **identical md5** (`27f3c056…`) for the same inputs.
+
+The browser implementation is `FMP4.muxStream`; `tools/fmp4stream.js` is the same logic as a Node CLI (with RSS sampling), and `tools/fmp4mux.js` is the in-memory version you can cross-check against.
 
 ## Measured results
 
@@ -149,7 +165,8 @@ Download and merge verification (4 threads × 4 MB ranges):
 | Audio-only mode | exactly one `.m4a`, 4,755,777 bytes, equal to that track's `Content-Length` |
 | **Automatic merge (real output)** | AV1 360p track + 197 kbps audio → `_merged.mp4`, 9,470,592 bytes; `ffprobe` reports `av1 682×360` + `aac 48 kHz 2ch`, duration 192.81 s, **decodes with zero errors**, frame extraction fine |
 | Merge across codecs | H.264 682×360, HEVC 2048×1080 and AV1 910×480 all merged and fully decoded without errors |
-| **8K full merge** | 8192×4320 HEVC 488,674,799 B + 197 kbps audio 4,755,777 B → **493,428,872 bytes**; `ffprobe` reports `hevc 8192×4320` + `aac 48 kHz`, 192.81 s, zero decode errors. The merge itself takes under a second |
+| **8K full merge (in-memory version)** | 8192×4320 HEVC 488,674,799 B + 197 kbps audio 4,755,777 B → **493,428,872 bytes**; `ffprobe` reports `hevc 8192×4320` + `aac 48 kHz`, 192.81 s, zero decode errors |
+| **8K full merge (streaming version)** | same **493,428,872 bytes**, md5 identical to the in-memory version; finished in **2.08 s** with a **peak single-fragment size of 36.17 MB** (the in-memory version peaks around 1.4 GB); zero decode errors |
 
 ## Implementation notes
 
@@ -221,7 +238,7 @@ node  tools/test_fixes.js              # button placement + OPFS save path
 | "This browser does not support streaming save" | Firefox or Safari; switch the save method to "Save directly when done" |
 | "System folder is not allowed" | Desktop / Documents / Downloads / drive roots are Chrome system-reserved directories. Create a subfolder (e.g. `D:/bili`) and pick that |
 | Download stalls at 99% | A chunk failed all 3 retries (CDN hiccup). Abort and retry, or use "Copy aria2 command" |
-| Auto-merge skipped | The two tracks exceed 900 MB, so the script skips merging to avoid running out of memory. Use the `ffmpeg` command it prints |
+| Auto-merge skipped | Only in "Browser default download" mode, which has no writable handle and therefore must assemble everything in memory (700 MB cap). Switch to "Save directly when done" or "Pick a folder yourself" and it streams, with no such limit |
 | `_merged.mp4` has odd timing in some players | The output is a fragmented MP4. VLC / PotPlayer / Chrome / ffmpeg are all fine; a few legacy players only accept non-fragmented MP4 — run `ffmpeg -i merged.mp4 -c copy fixed.mp4` once |
 | No button on bangumi / course pages | Only `/video/*` and `/list/*` are matched. Anime uses the `pgc/player` API, which is not implemented |
 | 8K stutters on playback | Not a script issue: 8K HEVC needs a recent GPU decoder, and 8K AV1 is essentially software-decoded |

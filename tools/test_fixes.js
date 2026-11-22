@@ -163,7 +163,9 @@ const ok = (cond, label, extra) => {
   ok(saved.length === 1, '浏览器只收到 1 个保存请求', saved.join(' | '));
   ok(saved[0] && /_merged\.mp4$/.test(saved[0]), '保存的就是合并后的 mp4', saved[0]);
   ok(removed.length === 2, '中间两个文件已清理', removed.join(' , '));
-  ok(Object.keys(opfsFiles).length === 0, '私有存储里没有残留', JSON.stringify(Object.keys(opfsFiles)));
+  const left = Object.keys(opfsFiles);
+  ok(left.length === 1 && /_merged\.mp4$/.test(left[0]),
+    '私有存储里只剩合并结果（60s 后自动清理），中间两条轨已删', JSON.stringify(left));
   ok(!/✅ 已保存：.*_audio_/.test(progTxt), '弹窗里不再列出音频轨（已清理）');
 
   console.log(`\n===== ${pass} passed, ${fail} failed =====`);

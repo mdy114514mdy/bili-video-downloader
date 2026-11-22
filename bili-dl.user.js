@@ -376,6 +376,94 @@
       return cat([ftyp, moov, ...stream.map(x => x.buf)]);
     }
 
+    /**
+     * 流式重封装：v / a 传 {size, read(start,len)->Promise<Uint8Array>}，write 逐块落盘。
+     * 内存只与「单个片段」同量级（8K 的片段约 12MB），与文件总大小无关——
+     * 因此 466MB 的 8K 也不会把 WebView 撑爆。
+     */
+    async function muxStream(v, a, write, onStep) {
+      const HEAD = 1 << 20;
+      const hv = await v.read(0, Math.min(HEAD, v.size));
+      const ha = await a.read(0, Math.min(HEAD, a.size));
+      const topV = boxList(hv, 0, hv.length), topA = boxList(ha, 0, ha.length);
+      const ftypB = find(topV, 'ftyp'), moovV = find(topV, 'moov'), moovA = find(topA, 'moov');
+      if (!ftypB || !moovV || !moovA) throw new Error('不是 fMP4（前 1MB 里找不到 ftyp/moov）');
+      const ftyp = hv.slice(ftypB.start, ftypB.end);
+
+      const idV = trackId(hv, moovV);
+      const idA = idV === 2 ? 3 : 2;
+      const mvhdB = find(boxList(hv, moovV.body, moovV.end), 'mvhd');
+      const mvhd = hv.slice(mvhdB.start, mvhdB.end);
+      w32(mvhd, mvhd[8] === 1 ? 116 : 104, Math.max(idV, idA) + 1);
+
+      const trakV = extractTrak(hv, moovV);
+      const trakA = extractTrak(ha, moovA, idA);
+      const trexV = extractTrex(hv, moovV);
+      const trexA = extractTrex(ha, moovA, idA);
+      if (!trexV || !trexA) throw new Error('缺少 mvex/trex，无法合并');
+      const moov = wrap('moov', cat([mvhd, trakV, trakA, wrap('mvex', cat([trexV, trexA]))]));
+
+      const tsV = timescale(hv, find(boxList(hv, moovV.body, moovV.end), 'trak'));
+      const tsA = timescale(ha, find(boxList(ha, moovA.body, moovA.end), 'trak'));
+
+      async function scan(src, start, ts, tag) {
+        const list = [];
+        let pos = start;
+        while (pos + 8 <= src.size) {
+          const h = await src.read(pos, 16);
+          if (h.length < 8) break;
+          let size = u32(h, 0);
+          const type = fourcc(h, 4);
+          if (size === 1) size = u64(h, 8);
+          else if (size === 0) size = src.size - pos;
+          if (size < 8 || pos + size > src.size) break;
+          if (type === 'moof') {
+            const m = await src.read(pos, size);   // moof 只有几百字节~几 KB，必须整段读：截断会让 traf 越过边界、tfdt 解析失败
+            const traf = boxList(m, 8, m.length).find(x => x.type === 'traf');
+            let dt = 0, tidOff = null;
+            if (traf) {
+              const inner = boxList(m, traf.body, traf.end);
+              const tfhd = find(inner, 'tfhd'), tfdt = find(inner, 'tfdt');
+              if (tfhd) tidOff = tfhd.body + 4;
+              if (tfdt) dt = m[tfdt.body] === 1 ? u64(m, tfdt.body + 4) : u32(m, tfdt.body + 4);
+            }
+            let total = size;
+            if (pos + size + 8 <= src.size) {
+              const n = await src.read(pos + size, 16);
+              if (n.length >= 8 && fourcc(n, 4) === 'mdat') {
+                let msz = u32(n, 0);
+                if (msz === 1) msz = u64(await src.read(pos + size, 16), 8);   // 64 位 largesize
+                if (msz >= 8) total = size + msz;
+              }
+            }
+            list.push({ pos, size: total, t: dt / ts, tidOff, tag });
+            pos += total;
+            continue;
+          }
+          pos += size;
+        }
+        return list;
+      }
+
+      const segsV = await scan(v, moovV.end, tsV, 'v');
+      const segsA = await scan(a, moovA.end, tsA, 'a');
+      const all = segsV.concat(segsA).sort((x, y) => x.t - y.t);
+      const totalBytes = ftyp.length + moov.length + all.reduce((n, x) => n + x.size, 0);
+
+      await write(ftyp);
+      await write(moov);
+      let bytes = ftyp.length + moov.length;
+      for (const sg of all) {
+        const src = sg.tag === 'a' ? a : v;
+        const chunk = await src.read(sg.pos, sg.size);
+        if (sg.tag === 'a' && sg.tidOff !== null) w32(chunk, sg.tidOff, idA);
+        await write(chunk);
+        bytes += chunk.length;
+        if (onStep) onStep(bytes, totalBytes);
+      }
+      return { bytes, segs: all.length };
+    }
+
     /** 判断一个 buffer 是不是可合并的 fMP4 分片 */
     function isFmp4(b) {
       try {
@@ -384,7 +472,7 @@
       } catch (e) { return false; }
     }
 
-    return { mux, isFmp4 };
+    return { mux, muxStream, isFmp4 };
   })();
 
   /* ============================== 下载核心 ============================== */
@@ -1291,36 +1379,70 @@
   /** 下载完成后：读回两条轨 → 纯 JS 拼 → 写出一个带音轨的 mp4 */
   async function mergeTracks(vRes, aRes, vName, slot, dirHandle, opts) {
     opts = opts || {};
-    const take = async res => {
-      if (res.blob) return new Uint8Array(await res.blob.arrayBuffer());
-      const fh = await dirHandle.getFileHandle(res.name);
-      const f = await fh.getFile();
-      return new Uint8Array(await f.arrayBuffer());
-    };
-    const total = (vRes.size || 0) + (aRes.size || 0);
-    if (total > 900 * 1024 * 1024) throw new Error('两条轨合计超过 900MB，跳过自动合并（请用 ffmpeg 命令）');
-
-    slot.info.textContent = '读取已下载数据…';
-    const v = await take(vRes);
-    const a = await take(aRes);
-    slot.info.textContent = '合并中…';
-    const out = FMP4.mux(v, a);
-
     const name = vName.replace(/\.mp4$/i, '') + '_merged.mp4';
-    if (opts.toDownload) {
-      // OPFS 中转：合并完直接交给浏览器下载，本地只落这一个文件
-      triggerSave(new Blob([out], { type: 'video/mp4' }), name);
-    } else if (dirHandle) {
-      const fh = await dirHandle.getFileHandle(name, { create: true });
-      const w = await fh.createWritable();
-      await w.write(out);
-      await w.close();
-    } else {
-      triggerSave(new Blob([out], { type: 'video/mp4' }), name);
+
+    const openSrc = async res => {
+      if (res.blob) return res.blob;                       // blob 模式：直接拿 Blob（可 slice）
+      const fh = await dirHandle.getFileHandle(res.name);
+      return fh.getFile();                                  // OPFS / 目录模式：File 对象
+    };
+    const reader = f => ({
+      size: f.size,
+      read: async (start, len) => {
+        const end = Math.min(start + len, f.size);
+        if (end <= start) return new Uint8Array(0);
+        return new Uint8Array(await f.slice(start, end).arrayBuffer());
+      }
+    });
+
+    slot.info.textContent = '准备合并…';
+    const vf = await openSrc(vRes);
+    const af = await openSrc(aRes);
+
+    // 有落盘能力就走流式：内存只跟单个片段（几 MB）有关，8K 也不炸
+    if (dirHandle) {
+      const out = await dirHandle.getFileHandle(name, { create: true });
+      const w = await out.createWritable();
+      let last = -1;
+      try {
+        const r = await FMP4.muxStream(reader(vf), reader(af), u8 => w.write(u8), (bytes, total) => {
+          const pct = total ? Math.floor(bytes / total * 100) : 0;
+          if (pct !== last) {
+            last = pct;
+            slot.bar.style.width = pct + '%';
+            slot.info.textContent = '合并中 ' + pct + '%　' + fmtBytes(bytes) + ' / ' + fmtBytes(total);
+          }
+        });
+        await w.close();
+        slot.bar.style.width = '100%';
+        slot.info.textContent = '已合并 ' + fmtBytes(r.bytes);
+        if (opts.toDownload) {
+          const f = await out.getFile();
+          triggerSave(f, name);
+          // 给下载器留足读取时间后再清掉私有存储里的这份副本（否则 OPFS 会白占几百 MB）
+          setTimeout(() => { try { dirHandle.removeEntry(name); } catch (e) { } }, 60000);
+        }
+        return { name, size: r.bytes };
+      } catch (e) {
+        try { await w.abort(); } catch (_) { }
+        throw e;
+      }
     }
+
+    // 没有落盘能力（blob 模式）：只能拼在内存里，限制体积
+    const total = (vf.size || 0) + (af.size || 0);
+    if (total > 700 * 1024 * 1024) {
+      throw new Error('两条轨合计 ' + fmtBytes(total) + '，当前浏览器无法流式落盘，跳过自动合并');
+    }
+    slot.info.textContent = '读取数据…';
+    const v = new Uint8Array(await vf.arrayBuffer());
+    const a = new Uint8Array(await af.arrayBuffer());
+    slot.info.textContent = '合并中…';
+    const outBuf = FMP4.mux(v, a);
+    triggerSave(new Blob([outBuf], { type: 'video/mp4' }), name);
     slot.bar.style.width = '100%';
-    slot.info.textContent = '已合并 ' + fmtBytes(out.length);
-    return { name, size: out.length };
+    slot.info.textContent = '已合并 ' + fmtBytes(outBuf.length);
+    return { name, size: outBuf.length };
   }
 
   function setDownloading(on) {
