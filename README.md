@@ -26,15 +26,15 @@ Tampermonkey userscript that puts a **Download** button next to Bilibili's share
 
 **② 直接点这个地址安装** —— Tampermonkey 会接管并弹出安装页：
 
-```
 https://raw.githubusercontent.com/mdy114514mdy/bili-video-downloader/main/bili-dl.user.js
-```
 
-也可以从版本页下载附件（同样是 `bili-dl.user.js`）：
+点不动就复制这一串到地址栏（和上面完全一致）：
 
-```
+`https://raw.githubusercontent.com/mdy114514mdy/bili-video-downloader/main/bili-dl.user.js`
+
+想从版本页拿附件（同样是 `bili-dl.user.js`）：
+
 https://github.com/mdy114514mdy/bili-video-downloader/releases/latest
-```
 
 **③ 打开任意 `https://www.bilibili.com/video/BV...` 页面**，「分享」右边就有 **⬇ 下载视频**。
 
