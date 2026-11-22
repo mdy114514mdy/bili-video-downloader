@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站视频下载器 Pro（多分辨率/帧率/码率）
 // @namespace    local.bili.video.dl
-// @version      1.0.0
+// @version      1.1.0
 // @description  在B站视频播放页「分享」按钮右侧加入「下载视频」按钮：自动探测当前视频全部可用的 DASH 视频流（分辨率 / 帧率 / 码率 / 编码）与音频流，弹窗选择后多线程分块下载。支持分P、音视频分离保存、复制 aria2 / ffmpeg 命令。
 // @author       LittleCodeSauce
 // @match        https://www.bilibili.com/video/*
@@ -241,6 +241,152 @@
     return r.data;
   }
 
+  /* ============================== fMP4 纯 JS 合并 ============================== */
+  /**
+   * B 站 DASH 的音视频是两个 fMP4（ftyp + moov + (moof+mdat)*），两条轨 track_id 天然不同（1 / 2）。
+   * 这里只做「搬家 + 换 moov」：mvhd(视频的, next_track_ID=3) + trak_v + trak_a + mvex(trex_v+trex_a)，
+   * 再把所有 (moof+mdat) 按 tfdt 解码时间交错输出。不重编码，几 MB 的视频毫秒级完成。
+   */
+  const FMP4 = (function () {
+    const u32 = (b, p) => ((b[p] << 24) | (b[p + 1] << 16) | (b[p + 2] << 8) | b[p + 3]) >>> 0;
+    const u64 = (b, p) => u32(b, p) * 4294967296 + u32(b, p + 4);
+    const w32 = (b, p, v) => {
+      b[p] = (v >>> 24) & 255; b[p + 1] = (v >>> 16) & 255;
+      b[p + 2] = (v >>> 8) & 255; b[p + 3] = v & 255;
+    };
+    const fourcc = (b, p) => String.fromCharCode(b[p], b[p + 1], b[p + 2], b[p + 3]);
+
+    function boxList(b, start, end) {
+      const out = [];
+      let p = start;
+      while (p + 8 <= end) {
+        let size = u32(b, p);
+        const type = fourcc(b, p + 4);
+        let hdr = 8;
+        if (size === 1) { size = u64(b, p + 8); hdr = 16; }
+        else if (size === 0) { size = end - p; }
+        if (size < hdr || p + size > end) break;
+        out.push({ type, start: p, size, hdr, body: p + hdr, end: p + size });
+        p += size;
+      }
+      return out;
+    }
+    const find = (arr, t) => arr.find(x => x.type === t);
+
+    function split(b) {
+      const top = boxList(b, 0, b.length);
+      const ftyp = find(top, 'ftyp'), moov = find(top, 'moov');
+      const segs = [];
+      for (let i = 0; i < top.length; i++) {
+        if (top[i].type !== 'moof') continue;
+        const moof = top[i];
+        const mdat = top[i + 1] && top[i + 1].type === 'mdat' ? top[i + 1] : null;
+        segs.push({ moof, mdat, start: moof.start, end: mdat ? mdat.end : moof.end });
+        if (mdat) i++;
+      }
+      if (!ftyp || !moov) throw new Error('不是 fMP4 分片（缺 ftyp/moov）');
+      return { ftyp, moov, segs };
+    }
+
+    function extractTrak(b, moov, newId) {
+      const trak = find(boxList(b, moov.body, moov.end), 'trak');
+      if (!trak) throw new Error('moov 里没有 trak');
+      const copy = b.slice(trak.start, trak.end);
+      const tkhd = find(boxList(copy, 8, copy.length), 'tkhd');
+      if (tkhd && newId) w32(copy, tkhd.body + 4 + (copy[tkhd.body] === 1 ? 16 : 8), newId);
+      return copy;
+    }
+    function extractTrex(b, moov, newId) {
+      const mvex = find(boxList(b, moov.body, moov.end), 'mvex');
+      if (!mvex) return null;
+      const trex = find(boxList(b, mvex.body, mvex.end), 'trex');
+      if (!trex) return null;
+      const copy = b.slice(trex.start, trex.end);
+      if (newId) w32(copy, 12, newId);
+      return copy;
+    }
+    function wrap(type, body) {
+      const out = new Uint8Array(body.length + 8);
+      w32(out, 0, body.length + 8);
+      for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+      out.set(body, 8);
+      return out;
+    }
+    function cat(parts) {
+      let n = 0; for (const p of parts) n += p.length;
+      const out = new Uint8Array(n); let o = 0;
+      for (const p of parts) { out.set(p, o); o += p.length; }
+      return out;
+    }
+    function patchSegment(b, seg, newId) {
+      const copy = b.slice(seg.start, seg.end);
+      for (const traf of boxList(copy, seg.moof.hdr, seg.moof.size).filter(x => x.type === 'traf')) {
+        const tfhd = find(boxList(copy, traf.body, traf.end), 'tfhd');
+        if (tfhd) w32(copy, tfhd.body + 4, newId);
+      }
+      return copy;
+    }
+    function decodeTime(b, seg) {
+      for (const traf of boxList(b, seg.moof.body, seg.moof.end).filter(x => x.type === 'traf')) {
+        const tfdt = find(boxList(b, traf.body, traf.end), 'tfdt');
+        if (!tfdt) continue;
+        return b[tfdt.body] === 1 ? u64(b, tfdt.body + 4) : u32(b, tfdt.body + 4);
+      }
+      return 0;
+    }
+    function trackId(b, moov) {
+      const trak = find(boxList(b, moov.body, moov.end), 'trak');
+      const tkhd = find(boxList(b, trak.body, trak.end), 'tkhd');
+      return u32(b, tkhd.body + 4 + (b[tkhd.body] === 1 ? 16 : 8));
+    }
+    function timescale(b, trak) {
+      const mdia = find(boxList(b, trak.body, trak.end), 'mdia');
+      const mdhd = find(boxList(b, mdia.body, mdia.end), 'mdhd');
+      return b[mdhd.body] === 1 ? u32(b, mdhd.body + 20) : u32(b, mdhd.body + 12);
+    }
+
+    /** videoU8 + audioU8 → 一个新的 fMP4（Uint8Array） */
+    function mux(videoU8, audioU8) {
+      const vb = new Uint8Array(videoU8);
+      const ab = new Uint8Array(audioU8);
+      const V = split(vb), A = split(ab);
+      const idV = trackId(vb, V.moov);
+      const idA = idV === 2 ? 3 : 2;                 // 音频新 id 避开视频
+      const mvhdV = find(boxList(vb, V.moov.body, V.moov.end), 'mvhd');
+      const mvhd = vb.slice(mvhdV.start, mvhdV.end);
+      w32(mvhd, mvhd[8] === 1 ? 116 : 104, Math.max(idV, idA) + 1);
+
+      const trakV = extractTrak(vb, V.moov);
+      const trakA = extractTrak(ab, A.moov, idA);
+      const trexV = extractTrex(vb, V.moov);
+      const trexA = extractTrex(ab, A.moov, idA);
+      if (!trexV || !trexA) throw new Error('缺少 mvex/trex，无法合并');
+
+      const moov = wrap('moov', cat([mvhd, trakV, trakA, wrap('mvex', cat([trexV, trexA]))]));
+      const ftyp = vb.slice(V.ftyp.start, V.ftyp.end);
+
+      const tsV = timescale(vb, find(boxList(vb, V.moov.body, V.moov.end), 'trak'));
+      const tsA = timescale(ab, find(boxList(ab, A.moov.body, A.moov.end), 'trak'));
+
+      const stream = [];
+      for (const s of V.segs) stream.push({ t: decodeTime(vb, s) / tsV, buf: vb.slice(s.start, s.end) });
+      for (const s of A.segs) stream.push({ t: decodeTime(ab, s) / tsA, buf: patchSegment(ab, s, idA) });
+      stream.sort((a, b) => a.t - b.t);
+
+      return cat([ftyp, moov, ...stream.map(x => x.buf)]);
+    }
+
+    /** 判断一个 buffer 是不是可合并的 fMP4 分片 */
+    function isFmp4(b) {
+      try {
+        const u8 = new Uint8Array(b, 0, Math.min(b.byteLength, 64));
+        return fourcc(u8, 4) === 'ftyp';
+      } catch (e) { return false; }
+    }
+
+    return { mux, isFmp4 };
+  })();
+
   /* ============================== 下载核心 ============================== */
 
   /** 把一条流的 baseUrl + backupUrl 归一成候选 URL 列表，官方源优先 */
@@ -381,7 +527,7 @@
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 60000);
-    return { name, size: blob.size };
+    return { name, size: blob.size, blob };
   }
 
   async function downloadToMemory({ urls, size, onProgress, signal, threads }) {
@@ -787,6 +933,7 @@
       <div class="opts">
         <label><input type="checkbox" id="optAudio" checked> 同时下载音频</label>
         <label title="跳过视频轨，只把音频（m4a）扒下来，适合提取 BGM"><input type="checkbox" id="optAudioOnly"> 只下载音频</label>
+        <label title="用纯 JS 把视频轨和音频轨拼成一个 mp4，不重编码、不需要 ffmpeg"><input type="checkbox" id="optMerge" checked> 下载后自动合并</label>
         <label>线程 <select id="optThreads">
           <option value="1">1（最稳）</option><option value="4" selected>4（推荐）</option>
           <option value="8">8（最快，易被限速）</option></select></label>
@@ -1007,12 +1154,25 @@
         return downloadToBlob({ urls, size: 0, name, onProgress: onp, signal: state.job, threads });
       };
 
-      if (v) await doOne(vItem, vName, vHandle, vSlot);
-      if (withAudio) await doOne(aItem, aName, aHandle, aSlot);
+      const vRes = v ? await doOne(vItem, vName, vHandle, vSlot) : null;
+      const aRes = withAudio ? await doOne(aItem, aName, aHandle, aSlot) : null;
 
-      ui.tip.textContent = '完成';
+      // 纯 JS 自动合并（不需要 ffmpeg）
+      let merged = null, mergeErr = null;
+      const optMerge = root.getElementById('optMerge');
+      if (vRes && aRes && optMerge && optMerge.checked) {
+        const mSlot = slot('合并音视频轨（纯 JS，不重编码）');
+        try {
+          merged = await mergeTracks(vRes, aRes, vName, mSlot, dirHandle);
+        } catch (e) {
+          mergeErr = (e && e.message) || String(e);
+          mSlot.info.textContent = '合并失败：' + mergeErr;
+        }
+      }
+
+      ui.tip.textContent = merged ? '完成（已合并）' : '完成';
       setDownloading(false);
-      showDone(vName, withAudio ? aName : null);
+      showDone(vName, withAudio ? aName : null, merged, mergeErr);
     } catch (e) {
       setDownloading(false);
       if (e.message === 'ABORTED' || (e.name === 'AbortError')) {
@@ -1028,6 +1188,43 @@
     }
   }
 
+  /** 下载完成后：读回两条轨 → 纯 JS 拼 → 写出一个带音轨的 mp4 */
+  async function mergeTracks(vRes, aRes, vName, slot, dirHandle) {
+    const take = async res => {
+      if (res.blob) return new Uint8Array(await res.blob.arrayBuffer());
+      const fh = await dirHandle.getFileHandle(res.name);
+      const f = await fh.getFile();
+      return new Uint8Array(await f.arrayBuffer());
+    };
+    const total = (vRes.size || 0) + (aRes.size || 0);
+    if (total > 900 * 1024 * 1024) throw new Error('两条轨合计超过 900MB，跳过自动合并（请用 ffmpeg 命令）');
+
+    slot.info.textContent = '读取已下载数据…';
+    const v = await take(vRes);
+    const a = await take(aRes);
+    slot.info.textContent = '合并中…';
+    const out = FMP4.mux(v, a);
+
+    const name = vName.replace(/\.mp4$/i, '') + '_merged.mp4';
+    if (dirHandle) {
+      const fh = await dirHandle.getFileHandle(name, { create: true });
+      const w = await fh.createWritable();
+      await w.write(out);
+      await w.close();
+    } else {
+      const blob = new Blob([out], { type: 'video/mp4' });
+      const el = document.createElement('a');
+      el.href = URL.createObjectURL(blob);
+      el.download = name;
+      document.body.appendChild(el);
+      el.click();
+      setTimeout(() => { URL.revokeObjectURL(el.href); el.remove(); }, 60000);
+    }
+    slot.bar.style.width = '100%';
+    slot.info.textContent = '已合并 ' + fmtBytes(out.length);
+    return { name, size: out.length };
+  }
+
   function setDownloading(on) {
     ui.btnGo.disabled = on;
     ui.btnGo.textContent = on ? '下载中…' : '开始下载';
@@ -1040,15 +1237,20 @@
     prog.innerHTML = '<div class="err">' + escapeHtml(msg) + '</div>';
   }
 
-  function showDone(vName, aName) {
+  function showDone(vName, aName, merged, mergeErr) {
     const prog = root.getElementById('prog');
     if (!prog) return;
     prog.classList.add('show');
-    const cmds = (vName && aName) ? mergeCmd(vName, aName) : '';
+    const cmds = (vName && aName && !merged) ? mergeCmd(vName, aName) : '';
     const saved = [vName, aName].filter(Boolean).map(n => '✅ 已保存：' + escapeHtml(n)).join('<br>');
     prog.insertAdjacentHTML('beforeend', `
       <div style="margin-top:10px;font-size:12px;color:#63d18b;line-height:1.7">
         ${saved}
+        ${merged ? '<br><span style="color:#63d18b">🎬 已自动合并成一个带声音的 mp4：</span><br>' +
+        '<b>' + escapeHtml(merged.name) + '</b>　' + fmtBytes(merged.size) +
+        '<br><span style="color:#7c8288;font-size:11px">（纯 JS 重封装，音视频未重编码，直接双击播放）</span>' : ''}
+        ${mergeErr ? '<br><span style="color:#ff8a8a">自动合并失败：' + escapeHtml(mergeErr) +
+        ' —— 仍可用下面的命令手动合并</span>' : ''}
         ${cmds ? '<br><span style="color:#9499a0">合并成一个 mp4（视频轨不含声音）：</span><br>' +
         '<code style="display:block;background:rgba(0,0,0,.35);padding:8px 10px;border-radius:7px;' +
         'color:#c9ccd0;font-family:Consolas,monospace;font-size:11.5px;word-break:break-all;margin-top:5px">' +

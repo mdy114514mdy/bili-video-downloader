@@ -13,7 +13,8 @@ Tampermonkey userscript that puts a **Download** button next to Bilibili's share
 - **分P 支持**：多 P 视频顶部有下拉，切换即重新探测。
 - **流式写盘**：`FileSystemWritableFileStream` + 4MB Range 分块 × 4 线程，按块序号串行写入，背压 6 块 → 内存恒定，8K 几百 MB 也不会把标签页撑爆。
 - **只下载音频**：勾一个框跳过视频轨，直接拿到 `.m4a`（扒 BGM 用）。
-- **命令导出**：一键复制 `ffmpeg -c copy` 合并命令、或带 `Referer` 的 `aria2c -x8 -s8` 命令。
+- **下载完自动合并**：纯 JS 直接重封装 fMP4，把视频轨和音频轨拼成一个**带声音的 mp4**。不重编码、不装 ffmpeg、不加载 30MB 的 wasm——合并逻辑只有几十 KB。
+- **命令导出**：一键复制 `ffmpeg -c copy` 合并命令、或带 `Referer` 的 `aria2c -x8 -s8` 命令（合并失败时的兜底）。
 - **三级挂载兜底**：详情页工具栏 → 播放器控制栏 → 右下角悬浮按钮。B 站改版把按钮冲掉时会自动补回。
 
 ## 安装
@@ -48,6 +49,41 @@ ffmpeg -i "标题_8192x4320_HEVC_20281kbps.mp4" -i "标题_audio_197kbps.m4a" \
   - `选择保存位置（流式）`：边下边写盘，内存恒定，支持几十 GB（Chrome / Edge）。
   - `浏览器默认下载`：整段拼 Blob，大文件吃内存，只建议小视频或不支持 File System Access API 的浏览器（Firefox / Safari）。
 
+## 自动合并是怎么做到的
+
+B 站用的是 DASH，音视频是**两条独立的 fMP4**：
+
+```
+视频轨：ftyp + moov + (moof+mdat)×N      track_id = 1
+音频轨：ftyp + moov + (moof+mdat)×M      track_id = 2
+```
+
+所以「自动合并」的关键不是转码，而是**重封装**——把两条轨的片段搬进同一个容器。市面上的做法有三类：
+
+| 做法 | 代价 |
+|---|---|
+| 走 `fnval=0` 的 **durl** 接口（返回已封装的 mp4） | 画质封顶 1080P。实测 8K 视频在这个接口下只给 `qn=80`（2048×1080 / 48.1 MB），`accept_quality` 只有 `[80, 16]`，4K / 8K / HDR / 高帧率全都拿不到 |
+| 内置 **ffmpeg.wasm** | 首次要下 ~30MB wasm，大文件还得整个读进 wasm 的虚拟内存 |
+| 起**本地服务**（BBDown / yt-dlp） | 得在电脑上装东西，纯插件做不到 |
+
+本项目的做法是第四类：**直接操作 MP4 的 box 结构**。
+
+```
+① 取视频 moov 的 mvhd，把 next_track_ID 改成 3
+② 取视频的 trak、音频的 trak（音频 track_id 改 2）
+③ 取两条轨的 trex，拼出一个含两轨的 mvex
+④ 新 moov = mvhd + trak_v + trak_a + mvex
+⑤ 把两边所有 (moof+mdat) 按 tfdt 解码时间排序、交错，接在 moov 后面
+```
+
+不碰任何编码数据，只改几个 4 字节字段 + 重排片段顺序，所以：
+
+- 合并耗时在毫秒级（9MB 的文件 1 秒内完成，含下载）
+- 输出体积 ≈ 视频 + 音频，一个字节都不多
+- H.264 / HEVC / AV1 全都支持（只搬 trak，不看 codec 细节）
+
+浏览器里的实现在脚本内 `FMP4` 模块，约 150 行；`tools/fmp4mux.js` 是同一套逻辑的 Node 命令行版，方便验证。
+
 ## 实测数据
 
 测试视频 [`BV1qM4y1w716`](https://www.bilibili.com/video/BV1qM4y1w716)（8K 演示片，193s），大会员账号，探测出 **20 条视频轨 + 3 条音频轨**：
@@ -77,6 +113,9 @@ ffmpeg -i "标题_8192x4320_HEVC_20281kbps.mp4" -i "标题_audio_197kbps.m4a" \
 | 分块完整性 | 拼接 md5 与整段顺序下载 **字节级一致** |
 | 脚本真实写盘路径 | 写入 4,716,576 字节，与 CDN 整段下载 **md5 一致** |
 | 只下载音频 | 只产出 1 个 `.m4a`，4,755,777 字节，等于该音频轨 Content-Length |
+| **自动合并（脚本真实产出）** | 360P AV1 轨 + 197kbps 音频 → `_merged.mp4` 9,470,592 字节；ffprobe 认出 `av1 682×360` + `aac 48kHz 2ch`，时长 192.81s，**全解码零错误**，抽帧正常 |
+| 合并兼容性（三种编码） | H.264 682×360、HEVC 2048×1080、AV1 910×480 三条轨分别与音频合并，ffprobe 与全解码均通过 |
+| **8K 全量合并** | 8192×4320 HEVC 488,674,799 B + 197kbps 音频 4,755,777 B → `_merged.mp4` **493,428,872 字节**（视频+音频+1.3KB moov）；ffprobe 认出 `hevc 8192×4320` + `aac 48kHz`，时长 192.81s，解码零错误。拼接本身不到 1 秒 |
 
 ## 实现要点
 
@@ -103,7 +142,8 @@ w_rid    = md5(字典序拼接的 query + mixinKey)
 
 **分块下载**：`Range: bytes=start-end`，4MB/块、4 线程；按块序号**串行写入** `FileSystemWritableFileStream`，未落盘块超过 6 个就阻塞新请求（背压），内存占用恒定在 ~24MB。
 
-**CDN 优选**：候选 URL 按 `upos-*`（官方源）→ 其他 → `mcdn / p2p`（P2P 节点普遍限速）排序；每块失败自动换 `backupUrl`，重试 3 次。
+**CDN 优选**：候选 URL 按 `upos-*`（官方源）→ 其他 → `mcdn / p2p` 排序；每块失败自动换 `backupUrl`，重试 3 次。
+> 实测这条不是纸上保险：8K 测试里音频轨的 `baseUrl` 恰好落在 `xy112x82x162x39xy.mcdn.bilivideo.cn:8082`，直连直接被拒（`WinError 10061`），换成 `upos-sz-mirrorhwo1.bilivideo.com` 后 0.7 秒下完。
 
 **直链过期**：面板开着超过 10 分钟，点下载时会自动重取一次 `playurl` 换新链接。
 
@@ -114,6 +154,8 @@ bili-dl.user.js       用户脚本本体（单文件，1141 行，无外部依�
 tools/probe.py        只用 Python 列出某个 BV 的全部可用流（不需要装脚本）
 tools/smoke.js        jsdom 端到端冒烟：注入脚本 → 点按钮 → 断言弹窗内容（19 项）
 tools/test_download.js jsdom + mock 文件系统：抓脚本真实写入的字节，与整段下载比 md5
+tools/test_merge.js   端到端：下载 → 自动合并 → 抓出 _merged.mp4 交给 ffprobe 验
+tools/fmp4mux.js      fMP4 拼接的命令行版（node fmp4mux.js v.m4s a.m4s out.mp4）
 ```
 
 ### 自测
@@ -140,6 +182,8 @@ node  tools/test_download.js         # 字节级下载验证
 | 下载卡在 99% | 某块重试 3 次仍失败（CDN 抖动）。中断重下，或改用「复制 aria2 命令」 |
 | 番剧 / 课程页没按钮 | 只匹配 `/video/*` 与 `/list/*`；番剧走 `pgc/player` 另一套接口，未实现 |
 | 8K 播放卡顿 | 不是脚本问题。8K HEVC 要较新 GPU 硬解，AV1 8K 基本靠软解 |
+| 自动合并被跳过 | 两条轨合计超过 900MB 时主动跳过（要读回内存）。用弹窗给的 ffmpeg 命令合并 |
+| `_merged.mp4` 在某些播放器里时间轴怪 | 输出是 fragmented MP4。VLC / PotPlayer / Chrome / ffmpeg 都正常；个别老播放器只认非分片 mp4，用它看原始 `.mp4` + `.m4a` 或跑一次 `ffmpeg -i merged.mp4 -c copy fixed.mp4` |
 
 ## License
 
