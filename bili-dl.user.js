@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站视频下载器 Pro（多分辨率/帧率/码率）
 // @namespace    local.bili.video.dl
-// @version      1.1.0
+// @version      1.1.1
 // @description  在B站视频播放页「分享」按钮右侧加入「下载视频」按钮：自动探测当前视频全部可用的 DASH 视频流（分辨率 / 帧率 / 码率 / 编码）与音频流，弹窗选择后多线程分块下载。支持分P、音视频分离保存、复制 aria2 / ffmpeg 命令。
 // @author       LittleCodeSauce
 // @match        https://www.bilibili.com/video/*
@@ -566,32 +566,34 @@
 
   const TRIGGER_ID = 'bili-dl-trigger';
 
-  function findShareItemRobust() {
+  /** 找到操作栏 + 分享按钮：返回 {bar, share}；share 可能是内层元素，插入前会上提到 bar 的直接子元素 */
+  function findShareSlot() {
     const scopes = ['.video-toolbar-left', '[class*="video-toolbar-left"]',
-      '#arc_toolbar_report', '.video-info-container', '.video-toolbar-container'];
+      '#arc_toolbar_report', '.video-toolbar-left-container', '.video-toolbar-container'];
     for (const sel of scopes) {
-      const box = document.querySelector(sel);
-      if (!box) continue;
-      const items = Array.from(box.querySelectorAll(
-        '.video-toolbar-left-item, [class*="toolbar-left-item"], [class*="share"]'));
-      const byText = items.find(el => /^\s*分享\s*$/.test((el.textContent || '').trim()));
-      if (byText) return byText.closest('[class*="toolbar-left-item"]') || byText;
-      const byCls = box.querySelector('[class*="share"]');
-      if (byCls) return byCls;
-    }
-    // 文本兜底：小尺寸、文字恰好是「分享」
-    for (const sel of scopes) {
-      const box = document.querySelector(sel);
-      if (!box) continue;
-      const cand = Array.from(box.querySelectorAll('*')).find(el => {
+      const bar = document.querySelector(sel);
+      if (!bar) continue;
+      // ① 文字恰好是「分享」的叶子元素
+      let share = Array.from(bar.querySelectorAll('*')).find(el => {
         if (el.children.length > 2) return false;
         if ((el.textContent || '').trim() !== '分享') return false;
         const r = el.getBoundingClientRect();
-        return r.width > 8 && r.width < 200 && r.height > 6;
+        return r.width > 8 && r.width < 220;
       });
-      if (cand) return cand.closest('[class*="toolbar-left-item"]') || cand.parentElement;
+      // ② class 里带 share
+      if (!share) share = bar.querySelector('[class*="share" i]');
+      // ③ 都没有：直接以操作栏最后一项为锚点（分享通常就是最后一项）
+      if (!share) share = bar.lastElementChild;
+      return { bar, share };
     }
     return null;
+  }
+
+  /** 从任意后代向上，取 bar 的直接子元素 —— 插在它后面才不会换行 */
+  function topChild(el, bar) {
+    let cur = el;
+    while (cur && cur.parentElement && cur.parentElement !== bar) cur = cur.parentElement;
+    return (cur && cur.parentElement === bar) ? cur : null;
   }
 
   function makeTrigger(place) {
@@ -605,7 +607,7 @@
       'display:inline-flex', 'align-items:center', 'gap:5px', 'cursor:pointer',
       'font-size:13px', 'line-height:1', 'color:#61666d', 'padding:0 10px',
       'height:100%', 'min-height:32px', 'user-select:none', 'transition:.15s',
-      'border-radius:6px', 'white-space:nowrap', 'flex:0 0 auto'
+      'border-radius:6px', 'white-space:nowrap', 'flex:0 0 auto', 'align-self:center'
     ];
     if (place === 'ctrl') base.push('height:32px', 'color:#fff', 'opacity:.85', 'padding:0 8px');
     if (place === 'float') base.push('position:fixed', 'right:20px', 'bottom:140px',
@@ -624,7 +626,7 @@
       el.style.background = place === 'float' ? 'rgba(0,174,236,.9)' : 'rgba(0,174,236,.10)';
     });
     el.addEventListener('mouseleave', () => {
-      el.style.color = place === 'float' ? '#fff' : (place === 'ctrl' ? '#fff' : '#61666d');
+      el.style.color = place === 'float' ? '#fff' : '#61666d';
       el.style.background = place === 'float' ? 'rgba(24,25,28,.92)' : 'transparent';
     });
     el.addEventListener('click', ev => {
@@ -635,18 +637,27 @@
   }
 
   /**
-   * 三级挂载：①详情页「分享」右侧（默认）②播放器控制栏右下 ③右下角悬浮按钮
-   * 已挂成悬浮态但后来详情页渲染出来了，会升级回工具栏。
+   * 三级挂载：①详情页操作栏（分享右边，同一行）②播放器控制栏右下 ③右下角悬浮按钮
+   * 插完会做一次几何自检：如果按钮跑到分享下面去了，就挪到操作栏行末。
    */
   function mountTrigger() {
     const exist = document.getElementById(TRIGGER_ID);
-    if (exist && exist.dataset.place !== 'float') return;
 
-    const share = findShareItemRobust();
-    if (share && share.parentNode) {
+    const slot = findShareSlot();
+    if (slot && slot.bar) {
+      const bar = slot.bar;
+      if (exist && exist.dataset.place === 'toolbar' && exist.parentElement === bar) {
+        ensureInline(exist, bar, slot.share);
+        return;
+      }
       if (exist) exist.remove();
-      share.parentNode.insertBefore(makeTrigger('toolbar'), share.nextSibling);
-      console.log('[bili-dl] 按钮已挂到「分享」右侧');
+      const anchor = (slot.share && topChild(slot.share, bar)) || bar.lastElementChild;
+      const trigger = makeTrigger('toolbar');
+      if (anchor && anchor.parentElement === bar) bar.insertBefore(trigger, anchor.nextSibling);
+      else bar.appendChild(trigger);
+      ensureInline(trigger, bar, slot.share || anchor);
+      console.log('[bili-dl] 按钮已挂到操作栏 anchor=' +
+        (anchor ? (anchor.className || anchor.tagName) : 'none'));
       return;
     }
 
@@ -665,6 +676,26 @@
       document.body.appendChild(makeTrigger('float'));
       console.log('[bili-dl] 未找到工具栏，已使用右下角悬浮按钮');
     }
+  }
+
+  /** 几何自检：按钮顶边明显低于参考元素底边 => 换行了，挪到行末（只做一次） */
+  function ensureInline(trigger, bar, ref) {
+    if (!ref || trigger.dataset.inlineFixed === '1') return;
+    const check = () => {
+      try {
+        const rt = trigger.getBoundingClientRect();
+        const rr = ref.getBoundingClientRect();
+        if (rt.width > 0 && rr.width > 0 && rt.top > rr.bottom - 4) {
+          bar.appendChild(trigger);
+          trigger.dataset.inlineFixed = '1';
+          console.log('[bili-dl] 检测到按钮换行，已挪到操作栏行末');
+        } else if (rt.width > 0) {
+          trigger.dataset.inlineFixed = '1';
+        }
+      } catch (e) { }
+    };
+    requestAnimationFrame(check);
+    setTimeout(check, 800);
   }
 
   /* ============================== UI：面板 ============================== */
@@ -937,9 +968,11 @@
         <label>线程 <select id="optThreads">
           <option value="1">1（最稳）</option><option value="4" selected>4（推荐）</option>
           <option value="8">8（最快，易被限速）</option></select></label>
-        <label>保存方式 <select id="optSave">
-          <option value="fs">选择保存位置（流式，同名文件会被覆盖）</option>
-          <option value="blob">浏览器默认下载（大文件慎用）</option></select></label>
+        <label title="先把文件写进浏览器私有存储，下完自动合并再交给你保存——不用选文件夹，也不会被系统目录限制">保存方式 <select id="optSave">
+          <option value="opfs" selected>下完直接存（不用选文件夹）</option>
+          <option value="fs">自己选文件夹（流式，同名覆盖）</option>
+          <option value="blob">浏览器默认下载（整段进内存）</option></select></label>
+        <label title="只在「自己选文件夹」模式下生效；合并成功后删掉视频轨和音频轨，只留一个 mp4"><input type="checkbox" id="optClean" checked> 只留合并后的文件</label>
       </div>
       <div class="prog" id="prog"></div>`;
 
@@ -1043,6 +1076,38 @@
     };
   }
 
+  /** 浏览器私有存储（OPFS）：不用选目录，写入不受系统目录限制 */
+  async function opfsDir() {
+    const nav = (typeof unsafeWindow !== 'undefined' && unsafeWindow.navigator) ? unsafeWindow.navigator : navigator;
+    if (!nav.storage || !nav.storage.getDirectory) throw new Error('当前浏览器不支持本地暂存存储（OPFS）');
+    const root = await nav.storage.getDirectory();
+    return root.getDirectoryHandle('bili-dl', { create: true });
+  }
+
+  /** 触发浏览器下载（大 Blob 由浏览器自己落盘，不会全驻留内存） */
+  function triggerSave(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000);
+  }
+
+  function friendlyPickerError(e) {
+    const msg = String((e && e.message) || e);
+    const name = (e && e.name) || '';
+    if (/abort/i.test(name) || /aborted/i.test(msg)) return null;   // 用户自己取消
+    if (/system folder|system director|NotAllowedError|not allowed/i.test(name + ' ' + msg)) {
+      return '桌面 / 文档 / 下载 / 各盘根目录都属于系统保留目录，浏览器不允许直接写入。'
+        + '请在其中新建一个普通文件夹（例如 D:\bili）再选中它，或把保存方式换成「下完直接存」。';
+    }
+    if (/No permission|permission/i.test(name + ' ' + msg)) {
+      return '没有写入权限，换一个文件夹试试，或用「下完直接存」。';
+    }
+    return msg;
+  }
+
   async function onStartDownload() {
     if (state.job && !state.job.cancelled) return;
 
@@ -1058,30 +1123,38 @@
     const optThreads = root.getElementById('optThreads');
     const optSave = root.getElementById('optSave');
     const threads = parseInt(optThreads ? optThreads.value : '4', 10) || 4;
-    const mode = optSave ? optSave.value : 'fs';
+    const mode = (optSave && optSave.value) || 'opfs';
     const fileCount = (v ? 1 : 0) + (withAudio ? 1 : 0);
 
     // 授权窗口必须在用户手势里同步打开，所以先拿 handle，再发网络请求
     let dirHandle = null, vHandle = null, aHandle = null;
+    let opfsMode = false;
     const picker = getPicker();
     const pages = (state.view.pages || []);
     const pageIndex = state.pageIndex || 0;
     const page = pages[pageIndex] || { duration: state.view.duration };
 
-    if (mode === 'fs') {
+    if (mode === 'opfs') {
+      try {
+        dirHandle = await opfsDir();   // 不需要用户操作，也不会被系统目录限制
+        opfsMode = true;
+      } catch (e) {
+        renderInlineError('浏览器私有存储不可用（' + ((e && e.message) || e) +
+          '）。请把保存方式改成「自己选文件夹」，并新建一个普通文件夹（不要选桌面/文档/下载/盘根）。');
+        return;
+      }
+    } else if (mode === 'fs') {
       try {
         if (fileCount >= 2) {
-          if (!picker.dir) throw new Error('当前浏览器不支持文件夹选择，请把保存方式改成「浏览器默认下载」');
+          if (!picker.dir) throw new Error('这个浏览器不支持选文件夹，请把保存方式改成「下完直接存」');
           dirHandle = await picker.dir.call(picker.ctx, { id: 'bili-dl-out', mode: 'readwrite' });
         } else if (!picker.save) {
-          throw new Error('当前浏览器不支持流式保存，请把保存方式改成「浏览器默认下载」');
+          throw new Error('这个浏览器不支持流式保存，请把保存方式改成「下完直接存」');
         }
       } catch (e) {
-        if (e && (e.name === 'AbortError' || /aborted/i.test(String(e)))) {
-          ui.tip.textContent = '已取消选择';
-          return;
-        }
-        renderInlineError(e.message || String(e));
+        const friendly = friendlyPickerError(e);
+        if (friendly === null) { ui.tip.textContent = '已取消选择'; return; }
+        renderInlineError(friendly);
         return;
       }
     }
@@ -1136,10 +1209,10 @@
 
     try {
       // 流式保存：先授权文件 / 文件夹
-      if (mode === 'fs' && dirHandle) {
+      if (dirHandle) {
         if (v) vHandle = await dirHandle.getFileHandle(vName, { create: true });
         if (withAudio) aHandle = await dirHandle.getFileHandle(aName, { create: true });
-      } else if (mode === 'fs' && fileCount === 1) {
+      } else if (fileCount === 1) {
         const onlyName = v ? vName : aName;
         const h = await picker.save.call(picker.ctx, { suggestedName: onlyName, id: 'bili-dl-one' });
         if (v) vHandle = h; else aHandle = h;
@@ -1148,7 +1221,7 @@
       const doOne = async (item, name, handle, s) => {
         const urls = urlCandidates(item);
         const onp = p => { setSlot(s, p); };
-        if (mode === 'fs' && handle) {
+        if (handle) {
           return downloadToFile({ urls, size: 0, name, fileHandle: handle, onProgress: onp, signal: state.job, threads });
         }
         return downloadToBlob({ urls, size: 0, name, onProgress: onp, signal: state.job, threads });
@@ -1157,22 +1230,49 @@
       const vRes = v ? await doOne(vItem, vName, vHandle, vSlot) : null;
       const aRes = withAudio ? await doOne(aItem, aName, aHandle, aSlot) : null;
 
-      // 纯 JS 自动合并（不需要 ffmpeg）
-      let merged = null, mergeErr = null;
       const optMerge = root.getElementById('optMerge');
-      if (vRes && aRes && optMerge && optMerge.checked) {
+      const optClean = root.getElementById('optClean');
+      const wantMerge = !!(vRes && aRes && optMerge && optMerge.checked);
+
+      // 纯 JS 自动合并（不需要 ffmpeg）；OPFS 模式下合并结果直接交给浏览器下载
+      let merged = null, mergeErr = null;
+      if (wantMerge) {
         const mSlot = slot('合并音视频轨（纯 JS，不重编码）');
         try {
-          merged = await mergeTracks(vRes, aRes, vName, mSlot, dirHandle);
+          merged = await mergeTracks(vRes, aRes, vName, mSlot, dirHandle, { toDownload: opfsMode });
         } catch (e) {
           mergeErr = (e && e.message) || String(e);
           mSlot.info.textContent = '合并失败：' + mergeErr;
         }
       }
 
+      // OPFS 模式：没合并成功也要把（视频/音频）交给浏览器下载，本地只落这几个文件
+      if (opfsMode) {
+        const exportList = [];
+        if (!merged) {
+          if (vRes) exportList.push(vName);
+          if (aRes) exportList.push(aName);
+        }
+        for (const n of exportList) {
+          try {
+            const f = await (await dirHandle.getFileHandle(n)).getFile();
+            triggerSave(f, n);
+          } catch (e) { }
+        }
+        // 全部导出后清掉私有存储里的临时文件
+        for (const n of [vName, aName].filter(Boolean)) {
+          try { await dirHandle.removeEntry(n); } catch (e) { }
+        }
+      } else if (dirHandle && merged && optClean && optClean.checked) {
+        for (const n of [vName, aName].filter(Boolean)) {
+          try { await dirHandle.removeEntry(n); } catch (e) { }
+        }
+      }
+
       ui.tip.textContent = merged ? '完成（已合并）' : '完成';
       setDownloading(false);
-      showDone(vName, withAudio ? aName : null, merged, mergeErr);
+      showDone(vName, withAudio ? aName : null, merged, mergeErr,
+        opfsMode || (dirHandle && merged && optClean && optClean.checked));
     } catch (e) {
       setDownloading(false);
       if (e.message === 'ABORTED' || (e.name === 'AbortError')) {
@@ -1189,7 +1289,8 @@
   }
 
   /** 下载完成后：读回两条轨 → 纯 JS 拼 → 写出一个带音轨的 mp4 */
-  async function mergeTracks(vRes, aRes, vName, slot, dirHandle) {
+  async function mergeTracks(vRes, aRes, vName, slot, dirHandle, opts) {
+    opts = opts || {};
     const take = async res => {
       if (res.blob) return new Uint8Array(await res.blob.arrayBuffer());
       const fh = await dirHandle.getFileHandle(res.name);
@@ -1206,19 +1307,16 @@
     const out = FMP4.mux(v, a);
 
     const name = vName.replace(/\.mp4$/i, '') + '_merged.mp4';
-    if (dirHandle) {
+    if (opts.toDownload) {
+      // OPFS 中转：合并完直接交给浏览器下载，本地只落这一个文件
+      triggerSave(new Blob([out], { type: 'video/mp4' }), name);
+    } else if (dirHandle) {
       const fh = await dirHandle.getFileHandle(name, { create: true });
       const w = await fh.createWritable();
       await w.write(out);
       await w.close();
     } else {
-      const blob = new Blob([out], { type: 'video/mp4' });
-      const el = document.createElement('a');
-      el.href = URL.createObjectURL(blob);
-      el.download = name;
-      document.body.appendChild(el);
-      el.click();
-      setTimeout(() => { URL.revokeObjectURL(el.href); el.remove(); }, 60000);
+      triggerSave(new Blob([out], { type: 'video/mp4' }), name);
     }
     slot.bar.style.width = '100%';
     slot.info.textContent = '已合并 ' + fmtBytes(out.length);
@@ -1237,12 +1335,14 @@
     prog.innerHTML = '<div class="err">' + escapeHtml(msg) + '</div>';
   }
 
-  function showDone(vName, aName, merged, mergeErr) {
+  function showDone(vName, aName, merged, mergeErr, cleaned) {
     const prog = root.getElementById('prog');
     if (!prog) return;
     prog.classList.add('show');
     const cmds = (vName && aName && !merged) ? mergeCmd(vName, aName) : '';
-    const saved = [vName, aName].filter(Boolean).map(n => '✅ 已保存：' + escapeHtml(n)).join('<br>');
+    const kept = cleaned ? (merged ? [merged.name] : [vName, aName].filter(Boolean)) : [vName, aName].filter(Boolean);
+    const saved = kept.map(n => '✅ 已保存：' + escapeHtml(n)).join('<br>')
+      + (cleaned && merged && vName ? '<br><span style="color:#7c8288;font-size:11px">（中间的视频轨 / 音频轨已清理）</span>' : '');
     prog.insertAdjacentHTML('beforeend', `
       <div style="margin-top:10px;font-size:12px;color:#63d18b;line-height:1.7">
         ${saved}
