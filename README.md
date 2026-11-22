@@ -4,6 +4,8 @@
 
 Tampermonkey userscript that puts a **Download** button next to Bilibili's share button, enumerates every available DASH stream (resolution / fps / bitrate / codec), and downloads the one you pick with multi-threaded HTTP range requests writing straight to disk.
 
+**当前版本 v1.1.1** · [版本历史](https://github.com/mdy114514mdy/bili-video-downloader/releases) · 一行安装地址见下方「安装」。
+
 ---
 
 ## 特性
@@ -20,11 +22,28 @@ Tampermonkey userscript that puts a **Download** button next to Bilibili's share
 
 ## 安装
 
-1. 浏览器装 [Tampermonkey](https://www.tampermonkey.net/)。
-2. 打开 [`bili-dl.user.js`](bili-dl.user.js) 的 raw 地址（或点右上角 Raw），Tampermonkey 会弹安装页 → 安装。
-3. 打开任意 `https://www.bilibili.com/video/BV...` 页面，「分享」右边就有 **下载视频**。
+**① 先装 [Tampermonkey](https://www.tampermonkey.net/)**（没装的话，点开下面的地址只会显示源码）。
 
-手动方式：Tampermonkey → 添加新脚本 → 粘贴全文 → Ctrl+S。
+**② 直接点这个地址安装** —— Tampermonkey 会接管并弹出安装页：
+
+```
+https://raw.githubusercontent.com/mdy114514mdy/bili-video-downloader/main/bili-dl.user.js
+```
+
+也可以从版本页下载附件（同样是 `bili-dl.user.js`）：
+
+```
+https://github.com/mdy114514mdy/bili-video-downloader/releases/latest
+```
+
+**③ 打开任意 `https://www.bilibili.com/video/BV...` 页面**，「分享」右边就有 **⬇ 下载视频**。
+
+<details>
+<summary>手动安装（粘贴源码）</summary>
+
+Tampermonkey → 添加新脚本 → 把 `bili-dl.user.js` 全文粘进去 → Ctrl+S。
+
+</details>
 
 ## 用法
 
