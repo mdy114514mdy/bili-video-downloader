@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站视频下载器 Pro（多分辨率/帧率/码率）
 // @namespace    local.bili.video.dl
-// @version      1.1.1
+// @version      1.1.2
 // @description  在B站视频播放页「分享」按钮右侧加入「下载视频」按钮：自动探测当前视频全部可用的 DASH 视频流（分辨率 / 帧率 / 码率 / 编码）与音频流，弹窗选择后多线程分块下载。支持分P、音视频分离保存、复制 aria2 / ffmpeg 命令。
 // @author       LittleCodeSauce
 // @match        https://www.bilibili.com/video/*
