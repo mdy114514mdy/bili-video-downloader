@@ -4,7 +4,7 @@
 
 Tampermonkey userscript that puts a **Download** button next to Bilibili's share button, enumerates every available DASH stream (resolution / fps / bitrate / codec), and downloads the one you pick with multi-threaded HTTP range requests writing straight to disk.
 
-**当前版本 v1.1.1** · [版本历史](https://github.com/mdy114514mdy/bili-video-downloader/releases) · 一行安装地址见下方「安装」。
+**当前版本 v1.1.1** · [版本历史](https://github.com/mdy114514mdy/bili-video-downloader/releases) · 一行安装地址见下方「安装」 · [English README](README.en.md)
 
 ---
 
@@ -47,28 +47,42 @@ Tampermonkey → 添加新脚本 → 把 `bili-dl.user.js` 全文粘进去 → C
 
 ## 用法
 
-1. 点 **下载视频**，等 0.5 秒左右弹出面板。
-2. 挑视频轨 / 音频轨（默认选最高画质 + 最高码率音频）。
-3. 线程选 4。保存方式默认是 **「下完直接存（不用选文件夹）」**——文件先写进浏览器私有存储（OPFS），合并完再交给你，不会弹目录框，也绕开了系统目录限制。
-   - 想自己挑目录就选「自己选文件夹」：**必须新建一个普通文件夹**（`D:/bili` 这种）。桌面 / 文档 / 下载 / 各盘根目录都是 Chrome 的**系统保留目录，不允许写入**，选了会直接报错。
-4. **开始下载**。
-5. 下完点 **复制 ffmpeg 合并命令**：
+1. 点 **下载视频**，面板会在半秒内列出这个视频的全部可用流。
+2. 挑视频轨 / 音频轨（默认已经选好最高画质 + 最高码率音频，直接下一步也行）。
+3. 面板里的选项：
 
-```bash
-ffmpeg -i "标题_8192x4320_HEVC_20281kbps.mp4" -i "标题_audio_197kbps.m4a" \
-  -c copy -map 0:v:0 -map 1:a:0 "标题_8192x4320_HEVC_20281kbps_merged.mp4"
-```
+   | 选项 | 默认 | 说明 |
+   |---|---|---|
+   | 同时下载音频 | 勾选 | 关掉就只下视频轨（成品没有声音） |
+   | 只下载音频 | 不勾 | 勾上跳过视频轨，只拿一个 `.m4a`（扒 BGM 用） |
+   | 下载后自动合并 | 勾选 | 用纯 JS 把两条轨拼成一个带声音的 mp4 |
+   | 线程 | 4 | 1 最稳、8 最快但容易被 CDN 限速 |
+   | 只留合并后的文件 | 勾选 | 合并成功后删掉视频轨和音频轨 |
 
-> **为什么必须合并**：B 站是 DASH，视频轨和音频轨是两个独立 fMP4（`ftyp/iso5`）。浏览器里没法规格化封装 MP4，所以分开下、再用 ffmpeg 无损封装（`-c copy` 不重编码，几秒完成，画质零损失）。视频轨单独改名 `.mp4` 也能播，只是没声音。
+4. **保存方式**怎么选：
 
-没有 ffmpeg：`winget install Gyan.FFmpeg`，或下绿色版把 `ffmpeg.exe` 加进 PATH。
+   | 选项 | 行为 | 适合 |
+   |---|---|---|
+   | **下完直接存**（默认） | 先写浏览器私有存储（OPFS）→ 合并 → 交给浏览器下载 → 清掉临时文件。全程不弹目录框 | 大多数情况；尤其撞过「系统文件夹不允许」的 |
+   | 自己选文件夹 | 边下边写盘（File System Access），内存恒定 | 想自己控制落盘位置，或文件特别大 |
+   | 浏览器默认下载 | 整段拼成 Blob 再下载 | 不支持上面两个 API 的浏览器（Firefox / Safari） |
 
-### 其他
+   > **「自己选文件夹」有个 Chrome 硬限制**：桌面 / 文档 / 下载 / 各盘根目录都属于**系统保留目录，不允许写入**，选中会直接报错。必须自己新建一个普通文件夹（例如 `D:/bili`）再选它。
 
-- **复制 aria2 命令**：超大文件走 aria2 比浏览器更稳。直链约 2 小时过期，过期重开面板刷新。
-- **保存方式**
-  - `选择保存位置（流式）`：边下边写盘，内存恒定，支持几十 GB（Chrome / Edge）。
-  - `浏览器默认下载`：整段拼 Blob，大文件吃内存，只建议小视频或不支持 File System Access API 的浏览器（Firefox / Safari）。
+5. **开始下载**。下载过程中会分别显示视频轨 / 音频轨的进度与实时速度；下完自动合并，**本地只落一个带声音的 mp4**：
+
+   ```
+   标题_8192x4320_HEVC_20281kbps_merged.mp4
+   ```
+
+   双击就能播。
+
+   把「下载后自动合并」的勾去掉，则会得到视频轨 + 音频轨两个文件，弹窗同时给出 `ffmpeg -c copy` 合并命令（`-c copy` 不重编码，几秒完成，画质零损失）。视频轨单独改名 `.mp4` 也能播，只是没声音。
+
+### 其他按钮
+
+- **复制 ffmpeg 合并命令**：只在「没勾自动合并」或「合并失败」时需要。
+- **复制 aria2 命令**：带 `Referer` 头的 `aria2c -x8 -s8`，超大文件比浏览器内更稳。直链约 2 小时过期，过期重开一次面板刷新即可。
 
 ## 自动合并是怎么做到的
 
